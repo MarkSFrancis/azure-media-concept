@@ -30,25 +30,36 @@ var jobName = $"job-{mediaId}";
 var inputAssetName = $"input-{mediaId}";
 var outputAssetName = $"output-{mediaId}";
 
-WriteLine("Creating transform");
-var transform = await CreateTransformAsync(mediaServicesAccount, mediaId);
-WriteLine("Creating input asset");
-var inputAsset = await CreateInputAssetAsync(mediaServicesAccount, ContainerName, inputAssetName, InputFileName);
-WriteLine("Creating output asset");
-var outputAsset = await CreateOutputAssetAsync(mediaServicesAccount, ContainerName, outputAssetName);
+MediaTransformResource? transform = null;
+MediaAssetResource? inputAsset = null;
+MediaAssetResource? outputAsset = null;
+MediaJobResource? job = null;
 
-WriteLine("Starting transform...");
-var job = await SubmitJobAsync(transform, jobName, inputAsset, outputAsset);
-
-job = await WaitForJobCompletionAsync(job);
-
-if (job.Data.State == MediaJobState.Finished)
+try
 {
-    await DownloadOutputAsync(outputAsset, OutputFolder);
+    WriteLine("Creating transform");
+    transform = await CreateTransformAsync(mediaServicesAccount, mediaId);
+    WriteLine("Creating input asset");
+    inputAsset = await CreateInputAssetAsync(mediaServicesAccount, ContainerName, inputAssetName, InputFileName);
+    WriteLine("Creating output asset");
+    outputAsset = await CreateOutputAssetAsync(mediaServicesAccount, ContainerName, outputAssetName);
+
+    WriteLine("Executing transform...");
+    job = await SubmitJobAsync(transform, jobName, inputAsset, outputAsset);
+    job = await WaitForJobCompletionAsync(job);
 }
-else
+finally
 {
-    await CleanUpJobAsync(transform, job, inputAsset, outputAsset);
+    if (job?.Data.State == MediaJobState.Finished && outputAsset is { })
+    {
+        WriteLine("Downloading results...");
+        await DownloadOutputAsync(outputAsset, OutputFolder);
+    }
+    else
+    {
+        WriteLine("Job failed. Cleaning up...");
+        await CleanUpJobAsync(transform, job, inputAsset, outputAsset);
+    }
 }
 
 static async Task<MediaTransformResource> CreateTransformAsync(MediaServicesAccountResource account, string transformName)
@@ -260,10 +271,10 @@ async static Task DownloadOutputAsync(MediaAssetResource asset, string outputFol
 }
 
 async static Task CleanUpJobAsync(
-    MediaTransformResource transform,
-    MediaJobResource job,
-    MediaAssetResource inputAsset,
-    MediaAssetResource outputAsset)
+    MediaTransformResource? transform,
+    MediaJobResource? job,
+    MediaAssetResource? inputAsset,
+    MediaAssetResource? outputAsset)
 {
     WriteLine("Cleaning up...");
 
