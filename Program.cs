@@ -1,4 +1,6 @@
-﻿using Azure;
+﻿using System.Runtime.InteropServices;
+using Azure;
+using Azure.Core;
 using Azure.Identity;
 using Azure.ResourceManager;
 using Azure.ResourceManager.Media;
@@ -9,9 +11,8 @@ using static System.Environment;
 
 var OutputFolder = Path.Join(Environment.GetFolderPath(SpecialFolder.UserProfile), "Downloads", "output");
 var InputFileName = Path.Join(Environment.GetFolderPath(SpecialFolder.UserProfile), "Downloads", "input.mp4");
-var ContainerName = "files";
-// var OutputContainerFolder = "optimized";
-// var InputContainerFolder = "raw";
+var OutputContainerFolder = "optimized";
+var OutputContainerStorageUrl = "https://mediaexamplemoonstar.blob.core.windows.net/files/";
 
 WriteLine("Starting app");
 
@@ -21,7 +22,7 @@ var AZURE_SUBSCRIPTION_ID = "02b34e38-f3f1-4d44-94ad-21d9a06d27ca";
 
 var mediaServicesResourceId = MediaServicesAccountResource.CreateResourceIdentifier(AZURE_SUBSCRIPTION_ID, AZURE_RESOURCE_GROUP, AZURE_MEDIA_SERVICES_ACCOUNT_NAME);
 
-var credentials = new DefaultAzureCredential(includeInteractiveCredentials: true);
+var credentials = new DefaultAzureCredential();
 var armClient = new ArmClient(credentials);
 var mediaServicesAccount = armClient.GetMediaServicesAccountResource(mediaServicesResourceId);
 
@@ -40,9 +41,9 @@ try
     WriteLine("Creating transform");
     transform = await CreateTransformAsync(mediaServicesAccount, mediaId);
     WriteLine("Creating input asset");
-    inputAsset = await CreateInputAssetAsync(mediaServicesAccount, ContainerName, inputAssetName, InputFileName);
+    inputAsset = await CreateInputAssetAsync(mediaServicesAccount, inputAssetName, InputFileName);
     WriteLine("Creating output asset");
-    outputAsset = await CreateOutputAssetAsync(mediaServicesAccount, ContainerName, outputAssetName);
+    outputAsset = await CreateOutputAssetAsync(mediaServicesAccount, outputAssetName);
 
     WriteLine("Executing transform...");
     job = await SubmitJobAsync(transform, jobName, inputAsset, outputAsset);
@@ -50,17 +51,24 @@ try
 }
 finally
 {
-    if (job?.Data.State == MediaJobState.Finished && outputAsset is { })
+    try
     {
-        WriteLine("Downloading results...");
-        await DownloadOutputAsync(outputAsset, OutputFolder);
-    }
-    else
-    {
-        WriteLine("Job failed");
-    }
+        if (job?.Data.State == MediaJobState.Finished && outputAsset is { })
+        {
+            var outputUris = await ExportOutputToStorageAsync(outputAsset, credentials, OutputContainerStorageUrl, OutputContainerFolder, mediaId);
 
-    await CleanUpJobAsync(transform, job, inputAsset, outputAsset);
+            WriteLine($"Downloading results from {string.Join(", ", outputUris)}...");
+            await DownloadOutputAsync(outputUris, OutputFolder);
+        }
+        else
+        {
+            WriteLine("Job failed");
+        }
+    }
+    finally
+    {
+        await DeleteBlobsAsync(inputAsset, outputAsset);
+    }
 }
 
 static async Task<MediaTransformResource> CreateTransformAsync(MediaServicesAccountResource account, string transformName)
@@ -89,7 +97,7 @@ static async Task<MediaTransformResource> CreateTransformAsync(MediaServicesAcco
                                 Complexity = H264Complexity.Speed,
                                 Layers =
                                 {
-                                    new H264Layer(bitrate: 1200000)
+                                    new H264Layer(bitrate: 1600000)
                                     {
                                         Width = "1280",
                                         Height = "720",
@@ -118,7 +126,7 @@ static async Task<MediaTransformResource> CreateTransformAsync(MediaServicesAcco
     return transform.Value;
 }
 
-static async Task<MediaAssetResource> CreateInputAssetAsync(MediaServicesAccountResource account, string containerName, string assetName, string fileToUpload)
+static async Task<MediaAssetResource> CreateInputAssetAsync(MediaServicesAccountResource account, string assetName, string fileToUpload)
 {
     MediaAssetResource asset;
 
@@ -133,11 +141,7 @@ static async Task<MediaAssetResource> CreateInputAssetAsync(MediaServicesAccount
         var mediaAsset = await account.GetMediaAssets().CreateOrUpdateAsync(
             WaitUntil.Completed,
             assetName,
-            new MediaAssetData
-            {
-                // Container = containerName,
-                // StorageAccountName = "mediaexamplemoonstar",
-            }
+            new MediaAssetData()
         );
 
         asset = mediaAsset.Value;
@@ -165,18 +169,13 @@ static async Task<MediaAssetResource> CreateInputAssetAsync(MediaServicesAccount
     return asset;
 }
 
-static async Task<MediaAssetResource> CreateOutputAssetAsync(MediaServicesAccountResource account, string containerName, string assetName)
+static async Task<MediaAssetResource> CreateOutputAssetAsync(MediaServicesAccountResource account, string assetName)
 {
     var asset = await account.GetMediaAssets().CreateOrUpdateAsync(
         WaitUntil.Completed,
         assetName,
-        new MediaAssetData
-        {
-            // Container = containerName,
-        }
+        new MediaAssetData()
     );
-
-    // await MakeAssetPublicAsync(asset.Value);
 
     return asset.Value;
 }
@@ -245,50 +244,74 @@ static async Task<MediaJobResource> WaitForJobCompletionAsync(MediaJobResource j
     return job;
 }
 
-async static Task DownloadOutputAsync(MediaAssetResource asset, string outputFolderName)
+async static Task<IReadOnlyList<string>> ExportOutputToStorageAsync(MediaAssetResource outputAsset, TokenCredential credentials, string outputContainerStorageUrl, string outputContainerFolder, string mediaId)
 {
-    var assetContainerSas = asset.GetStorageContainerUrisAsync(new MediaAssetStorageContainerSasContent
+    WriteLine("Connecting to converted output...");
+    var assetContainerSas = outputAsset.GetStorageContainerUrisAsync(new MediaAssetStorageContainerSasContent
     {
         Permissions = MediaAssetContainerPermission.Read,
         ExpireOn = DateTime.UtcNow.AddHours(1),
     });
 
     var containerSasUrl = await assetContainerSas.FirstAsync();
-    var container = new BlobContainerClient(containerSasUrl);
+    
+    var results = await CopyAcrossBlobs(containerSasUrl, credentials, outputContainerStorageUrl, outputContainerFolder, mediaId);
+    return results;
+}
 
-    var outputDir = Path.Combine(outputFolderName, asset.Data.Name);
-    Directory.CreateDirectory(outputDir);
+async static Task<IReadOnlyList<string>> CopyAcrossBlobs(Uri inputContainerUrl, TokenCredential credentials, string outputContainerStorageUrl, string outputContainerFolder, string mediaId)
+{
+    WriteLine("Connecting to input");
+    var container = new BlobContainerClient(inputContainerUrl, credentials);
 
-    WriteLine($"Downloading results to {outputDir}");
+    WriteLine("Connecting to output");
+    var outputContainer = new BlobContainerClient(new Uri(outputContainerStorageUrl), credentials);
 
-    await foreach (var blob in container.GetBlobsAsync())
+    WriteLine("Getting files to copy");
+    var allFilesToCopy = await container.GetBlobsAsync().ToListAsync();
+    WriteLine($"Copying {allFilesToCopy.Count} files to output storage...");
+
+    var outputFiles = new List<string>(allFilesToCopy.Count);
+    foreach (var file in allFilesToCopy)
     {
-        var blobClient = container.GetBlobClient(blob.Name);
-        var filename = Path.Combine(outputDir, blob.Name);
-        await blobClient.DownloadToAsync(filename);
+        WriteLine($"Copying {file.Name} to output storage...");
+        var outputContainerClient = outputContainer.GetBlobClient($"{outputContainerFolder}/{file.Name}");
+        var copyResult = await outputContainerClient.StartCopyFromUriAsync(container.Uri);
+        await copyResult.WaitForCompletionAsync();
+        WriteLine($"Copied successfully to {outputContainerClient.Uri}.");
+    }
+
+    return outputFiles;
+}
+
+async static Task DownloadOutputAsync(IEnumerable<string> downloadUris, string outputFolderName)
+{
+    WriteLine($"Downloading results to {outputFolderName}");
+
+    HttpClient client = new HttpClient();
+    foreach (var blobUri in downloadUris)
+    {
+        var blobRelativePath = blobUri.Split("/optimized/").Last();
+        // Get if running on Windows
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            blobRelativePath = blobRelativePath.Replace("/", "\\");
+        }
+        var outputPath = Path.Combine(outputFolderName, blobRelativePath);
+        WriteLine($"Downloading {blobUri} to {outputPath}");
+
+        using var fileStream = new FileStream(outputPath, FileMode.Create);
+        using var stream = await client.GetStreamAsync(blobUri);
+        await stream.CopyToAsync(fileStream);
+
+        WriteLine($"Downloaded {blobUri}");
     }
 
     WriteLine("Download complete.");
 }
 
-async static Task CleanUpJobAsync(
-    MediaTransformResource? transform,
-    MediaJobResource? job,
-    MediaAssetResource? inputAsset,
-    MediaAssetResource? outputAsset)
+async static Task DeleteBlobsAsync(MediaAssetResource? inputAsset, MediaAssetResource? outputAsset)
 {
-    if (job != null)
-    {
-        WriteLine("Deleting job...");
-        await job.DeleteAsync(WaitUntil.Completed);
-    }
-
-    if (transform != null)
-    {
-        WriteLine("Deleting transform...");
-        await transform.DeleteAsync(WaitUntil.Completed);
-    }
-
     await Task.WhenAll(Task.Run(async () =>
     {
         if (inputAsset != null)
