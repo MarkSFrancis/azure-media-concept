@@ -57,9 +57,10 @@ finally
     }
     else
     {
-        WriteLine("Job failed. Cleaning up...");
-        await CleanUpJobAsync(transform, job, inputAsset, outputAsset);
+        WriteLine("Job failed");
     }
+
+    await CleanUpJobAsync(transform, job, inputAsset, outputAsset);
 }
 
 static async Task<MediaTransformResource> CreateTransformAsync(MediaServicesAccountResource account, string transformName)
@@ -276,8 +277,6 @@ async static Task CleanUpJobAsync(
     MediaAssetResource? inputAsset,
     MediaAssetResource? outputAsset)
 {
-    WriteLine("Cleaning up...");
-
     if (job != null)
     {
         WriteLine("Deleting job...");
